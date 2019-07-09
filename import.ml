@@ -139,6 +139,10 @@ let run root =
   let lmdb = lmdb (Filename.concat root "context") in
   irmin (Filename.concat root "context-pack") >>= fun irmin ->
   move ~src:lmdb ~dst:irmin
+  >|= fun () ->
+
+  let s = Irmin_pack.stats () in
+  Fmt.pr "Offset ratio: %g\n (measured over %d appends)" s.offset_ratio s.offset_significance
 
 let () =
   if Array.length Sys.argv <> 2 then Fmt.epr "usage: %s <data-dir>" Sys.argv.(0);
