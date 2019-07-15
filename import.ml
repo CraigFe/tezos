@@ -108,7 +108,9 @@ let key_of_entry e =
   | `Node -> "node/" ^ hash
   | `Contents -> "contents/" ^ hash
 
-let rec append (db, txn) x y z k v =
+let rec append ~count (db, txn) x y z k v =
+  incr count;
+  if !count mod 100 = 0 then Fmt.epr "\r%a%!" pp_stats ();
   let v = Bigstring.to_string v in
   match classify k with
   | `Contents k ->
@@ -130,7 +132,7 @@ let rec append (db, txn) x y z k v =
               | false ->
                   let k = key_of_entry e in
                   match Lmdb.get txn db k with
-                  | Ok v    -> (append[@tailcall]) (db, txn) x y z k v
+                  | Ok v    -> (append[@tailcall]) ~count (db, txn) x y z k v
                   | Error e ->
                       Fmt.epr "\n[error] %S: %a\n%!" k Lmdb.pp_error e;
                       assert false
@@ -146,10 +148,8 @@ let move ~src:(db, txn) ~dst:repo =
   Lmdb.cursor_first c >>* fun () ->
   P.Repo.batch repo (fun x y z ->
       Lmdb.cursor_fold_left c ~init:() ~f:(fun () (key, value) ->
-          incr count;
-          if !count mod 100 = 0 then Fmt.epr "\r%a%!" pp_stats ();
           Lwt.async (fun () ->
-              append (db, txn) x y z (Bigstring.to_string key) value);
+              append ~count (db, txn) x y z (Bigstring.to_string key) value);
           Ok ()
         ) >>* fun () ->
       Lwt.return ()
