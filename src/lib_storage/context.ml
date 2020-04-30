@@ -681,9 +681,11 @@ module Dumpable_context = struct
 
   let context_tree ctxt = ctxt.tree
 
-  let tree_hash = function
-    | `Node _ as tree ->
-        `Node (Store.Tree.hash tree)
+  let tree_hash t =
+    Store.Tree.destruct t
+    |> function
+    | `Node n ->
+        `Node Store.Tree.(hash (of_node n))
     | `Contents (b, _) ->
         `Blob (Store.Contents.hash b)
 
