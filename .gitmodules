@@ -1,0 +1,6 @@
+[submodule "vendors/irmin-rpc"]
+	path = vendors/irmin-rpc
+	url = https://github.com/mirage/irmin-rpc
+[submodule "vendors/irmin"]
+	path = vendors/irmin
+	url = https://github.com/mirage/irmin
