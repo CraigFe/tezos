@@ -25,10 +25,11 @@
 (*****************************************************************************)
 
 let () =
-  Alcotest.run
+  Alcotest_lwt.run
     "tezos-state"
     [ ("store", Test_store.tests);
       ("state", Test_state.tests);
       ("store checkpoint", Test_store_checkpoint.tests);
       ("state checkpoint", Test_state_checkpoint.tests);
       ("test protocol validator", Test_protocol_validator.tests) ]
+  |> Lwt_main.run
