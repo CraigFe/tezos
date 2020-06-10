@@ -450,12 +450,9 @@ let pruned_block_iterator index block_store limit header =
     >>= fun protocol_data -> return (None, Some protocol_data)
   else
     let pred_hash = header.Block_header.shell.predecessor in
-    State.Block.Header.read (block_store, pred_hash)
-    >>=? fun pred_header ->
-    Store.Block.Operations.bindings (block_store, pred_hash)
-    >>= fun pred_operations ->
-    Store.Block.Operation_hashes.bindings (block_store, pred_hash)
-    >>= fun pred_operation_hashes ->
+    State.Block.Header.read (block_store, pred_hash) >>=? fun pred_header ->
+    Store.Block.Operations.bindings (block_store, pred_hash) >>= fun pred_operations ->
+    Store.Block.Operation_hashes.bindings (block_store, pred_hash) >>= fun pred_operation_hashes ->
     let pruned_block =
       {
         Context.Pruned_block.block_header = pred_header;

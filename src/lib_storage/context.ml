@@ -757,24 +757,21 @@ let data_node_hash context =
   Store.Tree.get_tree context.tree current_data_key
   >|= fun tree -> Hash.to_context_hash (Store.Tree.hash tree)
 
+let triple_apply (f1, f2, f3) x = (f1 x, f2 x, f3 x)
+
 let get_protocol_data_from_header index block_header =
   checkout_exn index block_header.Block_header.shell.context
   >>= fun context ->
   let level = block_header.shell.level in
   let irmin_info = Dumpable_context.context_info context in
-  let date = Irmin.Info.date irmin_info in
-  let author = Irmin.Info.author irmin_info in
-  let message = Irmin.Info.message irmin_info in
+  let date, author, message = triple_apply Irmin.Info.(date, author, message) irmin_info in
   let info =
     {Protocol_data.timestamp = Time.Protocol.of_seconds date; author; message}
   in
   let parents = Dumpable_context.context_parents context in
-  get_protocol context
-  >>= fun protocol_hash ->
-  get_test_chain context
-  >>= fun test_chain_status ->
-  data_node_hash context
-  >>= fun data_key ->
+  get_protocol context >>= fun protocol_hash ->
+  get_test_chain context >>= fun test_chain_status ->
+  data_node_hash context >>= fun data_key ->
   Lwt.return
     ( level,
       {Protocol_data.parents; protocol_hash; test_chain_status; data_key; info}

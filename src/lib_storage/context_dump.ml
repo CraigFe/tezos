@@ -27,6 +27,9 @@
 
 let current_version = "tezos-snapshot-1.0.0"
 
+[@@@ocaml.warning "-26"]
+[@@@ocaml.warning "-32"]
+
 (*****************************************************************************)
 module type Dump_interface = sig
   type index
@@ -531,69 +534,208 @@ module Make (I : Dump_interface) = struct
       (v.version <> current_version)
       (Invalid_snapshot_version (v.version, current_version))
 
+  module Memprof = struct
+    [@@@ocaml.warning "-32"]
+
+    [@@@ocaml.warning "-37"]
+
+    type alloc_kind = Minor | Major | Unmarshalled
+
+    type sample_info = {
+      n_samples : int;
+      kind : alloc_kind;
+      tag : int;
+      size : int;
+      callstack : Printexc.raw_backtrace;
+    }
+
+    type 'a callback = sample_info -> (Obj.t, 'a) Ephemeron.K1.t option
+
+    type 'a ctrl = {
+      sampling_rate : float;
+      callstack_size : int;
+      callback : 'a callback;
+    }
+
+    let stopped_ctrl =
+      {
+        sampling_rate = 0.;
+        callstack_size = 0;
+        callback = (fun _ -> assert false);
+      }
+
+    external set_ctrl : 'a ctrl -> unit = "caml_memprof_set"
+
+    let start = set_ctrl
+
+    let stop () = set_ctrl stopped_ctrl
+  end
+
+  type location = [%import: Printexc.location] [@@deriving ord]
+
+  module Map = Map.Make (struct
+    type t = location array [@@deriving ord]
+  end)
+
+  let debug = false
+
+  let shape : ((int * int), int) Hashtbl.t = Hashtbl.create 0
+
+  let heap_log, statmemprof_log, shape_log =
+    Random.self_init ();
+    let uid = Random.int64 Int64.max_int in
+    let tmp_dir = Fmt.str "/tmp/stats-%Ld" uid in
+    let statfmt name = (tmp_dir ^ "/" ^ name) |> open_out |> Format.formatter_of_out_channel in
+
+    Unix.mkdir tmp_dir 0o755;
+    let heap = statfmt "heap" and statmemprof = statfmt "statmemprof" in
+
+    Fmt.pf heap "total visited,minor words,major words\n";
+    Fmt.pr "Stats streaming to `%s'\n%!" tmp_dir;
+    (heap, statmemprof, statfmt "shape")
+
+  let tbl = ref Map.empty
+  let memprof_active = ref false
+
+  let dump_tbl () =
+    if debug then
+      Map.bindings !tbl
+      |> List.sort (fun (_, (i, _)) (_, (j, _)) -> -Int.compare i j)
+      |> List.take_n 20
+      |> List.iter (fun (trace, (size_total, count)) ->
+            let pp_loc ppf
+                Printexc.{filename; line_number; start_char; end_char} =
+              Fmt.pf
+                ppf
+                "%s:%d (cols %d-%d)"
+                filename
+                line_number
+                start_char
+                end_char
+            in
+            Fmt.pf statmemprof_log
+              "%d       @[<v>Average size: %f@,@,%a@]\n\n%!"
+              count
+              (Float.of_int size_total /. Float.of_int count)
+              Fmt.(array ~sep:cut pp_loc)
+              trace)
+
+  let () =
+    let callback info =
+      let open Memprof in
+      let () =
+        if !memprof_active then
+          match (info.kind, Printexc.backtrace_slots info.callstack) with
+          | (_, None) | ((Major | Unmarshalled), _) ->
+            ()
+          | (Minor, Some slots) ->
+            slots |> Array.to_list
+            |> List.filter_map Printexc.Slot.location
+            |> fun locs ->
+            tbl :=
+              Map.update
+                (Array.of_list locs)
+                (function
+                  | Some (tot, i) -> Some (tot + info.size, i + 1)
+                  | None -> Some (info.size, 1))
+                !tbl
+      in
+      None
+    in
+    if debug then
+      Memprof.(start {sampling_rate = 0.001; callstack_size = 50; callback})
+
+  let print_state () =
+    dump_tbl () ;
+    Fmt.pf shape_log "count,depth,width\n";
+    Hashtbl.to_seq shape |> Seq.iter (fun ((depth, height), count) -> Fmt.pf shape_log "%d,%d,%d\n" count depth height);
+    ()
+
+  (* Folding through a node *)
+  let fold_tree_path ~(written : int ref) ~(maybe_flush : unit -> unit Lwt.t)
+      ~buf ctxt tree =
+    (* Noting the visited hashes *)
+    let visited_hash = Hashtbl.create 1000 in
+    let visited h = Hashtbl.mem visited_hash h in
+    let set_visit =
+      let total_visited = ref 0 in
+      fun h ->
+        if !total_visited mod 1_000 = 0 then (
+          let Gc.{major_words; minor_words; _} = Gc.quick_stat () in
+          Fmt.pf heap_log "%d,%f,%f\n%!" !total_visited minor_words major_words ;
+          if !total_visited = 3_000_000 then memprof_active := true ;
+          Tezos_stdlib_unix.Utils.display_progress
+            ~refresh_rate:(!total_visited, 1_000)
+            (fun m ->
+              m
+                "Context: %dK elements, %dMiB written%!"
+                (!total_visited / 1_000)
+                (!written / 1_048_576)) ) ;
+        incr total_visited ;
+        Hashtbl.add visited_hash h () ;
+        ()
+    in
+    let cpt = ref 0 in
+    let rec fold_tree_path ctxt tree =
+      I.tree_list tree
+      >>= fun keys ->
+      let keys = List.sort (fun (a, _) (b, _) -> String.compare a b) keys in
+      Lwt_list.map_s
+        (fun (name, kind) ->
+          I.sub_tree tree [name]
+          >>= function
+          | None ->
+              assert false
+          | Some sub_tree ->
+              let hash = I.tree_hash sub_tree in
+              ( if visited hash then Lwt.return_unit
+              else (
+                Tezos_stdlib_unix.Utils.display_progress
+                  ~refresh_rate:(!cpt, 1_000)
+                  (fun m ->
+                    m
+                      "Context: %dK elements, %dMiB written%!"
+                      (!cpt / 1_000)
+                      (!written / 1_048_576)) ;
+                incr cpt ;
+                set_visit hash ;
+                (* There cannot be a cycle *)
+                match kind with
+                | `Node ->
+                    fold_tree_path ctxt sub_tree
+                | `Contents -> (
+                    I.tree_content sub_tree
+                    >>= function
+                    | None ->
+                        assert false
+                    | Some data ->
+                        set_blob buf data ; maybe_flush () ) ) )
+              >|= fun () -> (name, hash))
+        keys
+      >>= fun sub_keys -> set_node buf sub_keys ; maybe_flush ()
+    in
+    fold_tree_path ctxt tree
+
+  let cons_option hd_opt tl =
+    match hd_opt with Some x -> x :: tl | None -> tl
+
   let dump_contexts_fd idx data ~fd =
     (* Dumping *)
     let buf = Buffer.create 1_000_000 in
     let written = ref 0 in
     let flush () =
       let contents = Buffer.contents buf in
-      Buffer.clear buf ;
+      Buffer.reset buf ;
       written := !written + String.length contents ;
       Lwt_utils_unix.write_string fd contents
     in
     let maybe_flush () =
-      if Buffer.length buf > 1_000_000 then flush () else Lwt.return_unit
-    in
-    (* Noting the visited hashes *)
-    let visited_hash = Hashtbl.create 1000 in
-    let visited h = Hashtbl.mem visited_hash h in
-    let set_visit h = Hashtbl.add visited_hash h () in
-    (* Folding through a node *)
-    let fold_tree_path ctxt tree =
-      let cpt = ref 0 in
-      let rec fold_tree_path ctxt tree =
-        I.tree_list tree
-        >>= fun keys ->
-        let keys = List.sort (fun (a, _) (b, _) -> String.compare a b) keys in
-        Lwt_list.map_s
-          (fun (name, kind) ->
-            I.sub_tree tree [name]
-            >>= function
-            | None ->
-                assert false
-            | Some sub_tree ->
-                let hash = I.tree_hash sub_tree in
-                ( if visited hash then Lwt.return_unit
-                else (
-                  Tezos_stdlib_unix.Utils.display_progress
-                    ~refresh_rate:(!cpt, 1_000)
-                    (fun m ->
-                      m
-                        "Context: %dK elements, %dMiB written%!"
-                        (!cpt / 1_000)
-                        (!written / 1_048_576)) ;
-                  incr cpt ;
-                  set_visit hash ;
-                  (* There cannot be a cycle *)
-                  match kind with
-                  | `Node ->
-                      fold_tree_path ctxt sub_tree
-                  | `Contents -> (
-                      I.tree_content sub_tree
-                      >>= function
-                      | None ->
-                          assert false
-                      | Some data ->
-                          set_blob buf data ; maybe_flush () ) ) )
-                >|= fun () -> (name, hash))
-          keys
-        >>= fun sub_keys -> set_node buf sub_keys ; maybe_flush ()
-      in
-      fold_tree_path ctxt tree
+      if (* true *) Buffer.length buf > 1_000_000 then flush ()
+      else Lwt.return_unit
     in
     Lwt.catch
       (fun () ->
-        let (bh, block_data, mode, pruned_iterator) = data in
+        let (bh, _block_data, mode, _pruned_iterator) = data in
         write_snapshot_metadata ~mode buf ;
         I.get_context idx bh
         >>= function
@@ -601,55 +743,51 @@ module Make (I : Dump_interface) = struct
             fail @@ Context_not_found (I.Block_header.to_bytes bh)
         | Some ctxt ->
             let tree = I.context_tree ctxt in
-            fold_tree_path ctxt tree
+            fold_tree_path ~written ~maybe_flush ~buf ctxt tree
             >>= fun () ->
             Tezos_stdlib_unix.Utils.display_progress_end () ;
-            let parents = I.context_parents ctxt in
-            set_root buf bh (I.context_info ctxt) parents block_data ;
-            (* Dump pruned blocks *)
-            let dump_pruned cpt pruned =
-              Tezos_stdlib_unix.Utils.display_progress
-                ~refresh_rate:(cpt, 1_000)
-                (fun m ->
-                  m
-                    "History: %dK block, %dMiB written"
-                    (cpt / 1_000)
-                    (!written / 1_048_576)) ;
-              set_proot buf pruned ;
-              maybe_flush ()
-            in
-            let rec aux cpt acc header =
-              pruned_iterator header
-              >>=? function
-              | (None, None) ->
-                  return acc (* assert false *)
-              | (None, Some protocol_data) ->
-                  return (protocol_data :: acc)
-              | (Some pred_pruned, Some protocol_data) ->
-                  dump_pruned cpt pred_pruned
-                  >>= fun () ->
-                  aux
-                    (succ cpt)
-                    (protocol_data :: acc)
-                    (I.Pruned_block.header pred_pruned)
-              | (Some pred_pruned, None) ->
-                  dump_pruned cpt pred_pruned
-                  >>= fun () ->
-                  aux (succ cpt) acc (I.Pruned_block.header pred_pruned)
-            in
-            let starting_block_header = I.Block_data.header block_data in
-            aux 0 [] starting_block_header
-            >>=? fun protocol_datas ->
-            (* Dump protocol data *)
-            Lwt_list.iter_s
-              (fun proto -> set_loot buf proto ; maybe_flush ())
-              protocol_datas
-            >>= fun () ->
-            Tezos_stdlib_unix.Utils.display_progress_end () ;
-            return_unit
-            >>=? fun () ->
-            set_end buf ;
-            flush () >>= fun () -> return_unit)
+            (* written := 0;
+             * let parents = I.context_parents ctxt in
+             * set_root buf bh (I.context_info ctxt) parents block_data ;
+             * (\* Dump pruned blocks *\)
+             * let dump_pruned =
+             *   let counter = ref 0 in
+             *   fun pruned ->
+             *     incr counter ;
+             *     Tezos_stdlib_unix.Utils.display_progress
+             *       ~refresh_rate:(!counter, 1_000)
+             *       (fun m ->
+             *         m
+             *           "History: %dK block, %dMiB written"
+             *           (!counter / 1_000)
+             *           (!written / 1_048_576)) ;
+             *     set_proot buf pruned ;
+             *     maybe_flush ()
+             * in
+             * let rec aux acc header =
+             *   pruned_iterator header
+             *   >>=? fun (pred_opt, pdata) ->
+             *   let acc = cons_option pdata acc in
+             *   match pred_opt with
+             *   | None -> return acc
+             *   | Some pred_pruned ->
+             *     dump_pruned pred_pruned
+             *       >>= fun () ->
+             *       (aux [@ocaml.tailcall]) acc (I.Pruned_block.header pred_pruned)
+             * in
+             * let starting_block_header = I.Block_data.header block_data in
+             * aux [] starting_block_header
+             * >>=? fun protocol_datas ->
+             * (\* Dump protocol data *\)
+             * Lwt_list.iter_s
+             *   (fun proto -> set_loot buf proto ; maybe_flush ())
+             *   protocol_datas
+             * >>= fun () ->
+             * Tezos_stdlib_unix.Utils.display_progress_end () ;
+             * return_unit
+             * >>=? fun () ->
+             * set_end buf ; *)
+            flush () >>= fun () -> print_state () ; return_unit)
       (function
         | Unix.Unix_error (e, _, _) ->
             fail @@ System_write_error (Unix.error_message e)

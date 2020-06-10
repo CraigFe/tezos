@@ -8,7 +8,9 @@
             digestif.c
             irmin
             irmin-pack
-            tezos-stdlib-unix)
+            tezos-stdlib-unix
+            ppx_deriving.runtime)
+ (preprocess (pps ppx_import ppx_deriving.show ppx_deriving.ord))
  (flags (:standard -open Tezos_shell_services
                    -open Tezos_base__TzPervasives
                    -open Tezos_stdlib_unix
