@@ -25,184 +25,15 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+include Context_dump_intf
+
 let current_version = "tezos-snapshot-1.0.0"
 
+[@@@warning "-27"]
+
+[@@@warning "-32"]
+
 (*****************************************************************************)
-module type Dump_interface = sig
-  type index
-
-  type context
-
-  type tree
-
-  type hash
-
-  type step = string
-
-  type key = step list
-
-  type commit_info
-
-  type batch
-
-  val batch : index -> (batch -> 'a Lwt.t) -> 'a Lwt.t
-
-  val commit_info_encoding : commit_info Data_encoding.t
-
-  val hash_encoding : hash Data_encoding.t
-
-  module Block_header : sig
-    type t = Block_header.t
-
-    val to_bytes : t -> Bytes.t
-
-    val of_bytes : Bytes.t -> t option
-
-    val equal : t -> t -> bool
-
-    val encoding : t Data_encoding.t
-  end
-
-  module Pruned_block : sig
-    type t
-
-    val to_bytes : t -> Bytes.t
-
-    val of_bytes : Bytes.t -> t option
-
-    val header : t -> Block_header.t
-
-    val encoding : t Data_encoding.t
-  end
-
-  module Block_data : sig
-    type t
-
-    val to_bytes : t -> Bytes.t
-
-    val of_bytes : Bytes.t -> t option
-
-    val header : t -> Block_header.t
-
-    val encoding : t Data_encoding.t
-  end
-
-  module Protocol_data : sig
-    type t
-
-    val to_bytes : t -> Bytes.t
-
-    val of_bytes : Bytes.t -> t option
-
-    val encoding : t Data_encoding.t
-  end
-
-  module Commit_hash : sig
-    type t
-
-    val to_bytes : t -> Bytes.t
-
-    val of_bytes : Bytes.t -> t tzresult
-
-    val encoding : t Data_encoding.t
-  end
-
-  (* commit manipulation (for parents) *)
-  val context_parents : context -> Commit_hash.t list
-
-  (* Commit info *)
-  val context_info : context -> commit_info
-
-  (* block header manipulation *)
-  val get_context : index -> Block_header.t -> context option Lwt.t
-
-  val set_context :
-    info:commit_info ->
-    parents:Commit_hash.t list ->
-    context ->
-    Block_header.t ->
-    Block_header.t option Lwt.t
-
-  (* for dumping *)
-  val context_tree : context -> tree
-
-  val tree_hash : tree -> hash
-
-  val sub_tree : tree -> key -> tree option Lwt.t
-
-  val tree_list : tree -> (step * [`Contents | `Node]) list Lwt.t
-
-  val tree_content : tree -> string option Lwt.t
-
-  (* for restoring *)
-  val make_context : index -> context
-
-  val update_context : context -> tree -> context
-
-  val add_string : batch -> string -> tree Lwt.t
-
-  val add_dir : batch -> (step * hash) list -> tree option Lwt.t
-end
-
-module type S = sig
-  type index
-
-  type context
-
-  type block_header
-
-  type block_data
-
-  type pruned_block
-
-  type protocol_data
-
-  val dump_contexts_fd :
-    index ->
-    block_header
-    * block_data
-    * History_mode.t
-    * (block_header ->
-      (pruned_block option * protocol_data option) tzresult Lwt.t) ->
-    fd:Lwt_unix.file_descr ->
-    unit tzresult Lwt.t
-
-  val restore_contexts_fd :
-    index ->
-    fd:Lwt_unix.file_descr ->
-    ((Block_hash.t * pruned_block) list -> unit tzresult Lwt.t) ->
-    (block_header option ->
-    Block_hash.t ->
-    pruned_block ->
-    unit tzresult Lwt.t) ->
-    ( block_header
-    * block_data
-    * History_mode.t
-    * Block_header.t option
-    * Block_hash.t list
-    * protocol_data list )
-    tzresult
-    Lwt.t
-end
-
-type error += System_write_error of string
-
-type error += Bad_hash of string * Bytes.t * Bytes.t
-
-type error += Context_not_found of Bytes.t
-
-type error += System_read_error of string
-
-type error += Inconsistent_snapshot_file
-
-type error += Inconsistent_snapshot_data
-
-type error += Missing_snapshot_data
-
-type error += Invalid_snapshot_version of string * string
-
-type error += Restore_context_failure
-
 let () =
   let open Data_encoding in
   register_error_kind
@@ -531,6 +362,20 @@ module Make (I : Dump_interface) = struct
       (v.version <> current_version)
       (Invalid_snapshot_version (v.version, current_version))
 
+  let heap_log =
+    Random.self_init () ;
+    let uid = Random.int64 Int64.max_int in
+    let tmp_dir = Fmt.str "/tmp/stats-%Ld" uid in
+    let statfmt name =
+      tmp_dir ^ "/" ^ name |> open_out |> Format.formatter_of_out_channel
+    in
+    Unix.mkdir tmp_dir 0o755 ;
+    let heap = statfmt "heap" in
+    Fmt.pf heap "sys time,total visited,maxrss\n" ;
+    Fmt.pr "This run has id `%Ld'\n" uid ;
+    Fmt.pr "Stats streaming to `%s'\n%!" tmp_dir ;
+    heap
+
   let dump_contexts_fd idx data ~fd =
     (* Dumping *)
     let buf = Buffer.create 1_000_000 in
@@ -572,6 +417,17 @@ module Make (I : Dump_interface) = struct
                         "Context: %dK elements, %dMiB written%!"
                         (!cpt / 1_000)
                         (!written / 1_048_576)) ;
+                  ( if !cpt mod 10_000 = 0 then
+                    let Rusage.{maxrss; _} =
+                      Rusage.(get Self)
+                      (* Result in kB *)
+                    in
+                    Fmt.pf
+                      heap_log
+                      "%f,%d,%Ld\n%!"
+                      (Sys.time ())
+                      !cpt
+                      (Int64.div maxrss 1_000L) ) ;
                   incr cpt ;
                   set_visit hash ;
                   (* There cannot be a cycle *)
@@ -590,6 +446,14 @@ module Make (I : Dump_interface) = struct
         >>= fun sub_keys -> set_node buf sub_keys ; maybe_flush ()
       in
       fold_tree_path ctxt tree
+      >|= fun () ->
+      let Rusage.{maxrss; _} = Rusage.(get Self) (* Result in kB *) in
+      Fmt.pf
+        heap_log
+        "%f,%d,%Ld\n%!"
+        (Sys.time ())
+        !cpt
+        (Int64.div maxrss 1_000L)
     in
     Lwt.catch
       (fun () ->
