@@ -16,6 +16,7 @@ __pycache__
 /docs/api/tezos-accuser-alpha.html
 /docs/api/tezos-baker-alpha.html
 /docs/api/tezos-endorser-alpha.html
+/duniverse
 
 /tezos-node
 /tezos-validator

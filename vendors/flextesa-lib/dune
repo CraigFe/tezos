@@ -8,7 +8,6 @@
     lwt.unix
     cmdliner
     easy-format
-    dum
     base
     genspio
     ezjsonm

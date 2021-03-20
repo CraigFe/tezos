@@ -2,4 +2,4 @@
  (release
   (ocamlopt_flags (:standard -O3))))
 
-(vendored_dirs vendors)
+(vendored_dirs vendors duniverse)

@@ -157,7 +157,7 @@ module Blake2b = struct
     let outbuf = Bytes.create len in
     (* HACL* doesn't yet provide a multiplexing interface for Blake2b so we
      * perform this check here and use the faster version if possible *)
-    if AutoConfig2.(has_feature AVX2) then
+    if AutoConfig2.(has_feature VEC256) then
       Hacl.Blake2b_256.hash key inbuf outbuf
     else Hacl.Blake2b_32.hash key inbuf outbuf ;
     Hash outbuf

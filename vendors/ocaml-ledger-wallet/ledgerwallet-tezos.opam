@@ -13,5 +13,5 @@ build: [
 ]
 depends: [
   "dune" {build & >= "1.7"}
-  "ledgerwallet" {= "dev"}
+  "ledgerwallet" {= version}
 ]

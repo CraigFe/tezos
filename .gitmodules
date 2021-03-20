@@ -1,0 +1,3 @@
+[submodule "vendors/ocaml-bls12-381"]
+	path = vendors/ocaml-bls12-381
+	url = git://github.com/CraigFe/ocaml-bls12-381.git
